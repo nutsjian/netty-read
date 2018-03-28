@@ -1,0 +1,63 @@
+Netty 的零拷贝体现在三个方面：
+========================================================================================================================
+1. Netty 的接收和发送 ByteBuffer 采用的是 Direct buffer，使用堆外直接内存进行 socket 读写，不需要进行字节缓冲区的二次拷贝。
+如果使用传统的堆内内存（Heap Buffer)进行 socket 读写。JVM 会将堆内内存buffer 拷贝一份到直接内存中，然后才写入 Socket。多了
+一次内存拷贝的操作。
+
+2. Netty 提供了组合 Buffer 对象，可以聚合多个 ByteBuffer 对象，用户可以像操作一个Buffer那样方便的对组合 buffer 进行操作，
+避免了传统通过内存拷贝的方式将几个小的buffer合并成一个大的Buffer
+
+3. Netty 的文件传输采用了 transferTo 方法，它可以直接将文件缓冲区的数据发送到目标 Channel，避免了传统通过循环 write 方式
+导致的内存拷贝问题。
+
+
+几个跟零拷贝重要的概念
+========================================================================================================================
+(1)、Direct Buffers：使用 堆外内存，可以在socket发送数据的时候，减少一次从 堆内内存 拷贝到 堆外内存的操作。
+(2)、Composite Buffers：传统的 ByteBuffer，如果需要将两个 ByteBuffer 中的数据组合在一起，我们需要首先创建一个 size = size1 + size2
+大小的新的数组，然后将两个数组中的数据拷贝到新的数组中。但是使用 Netty 提供的 Composite Buffer，就可以避免这样的操作，
+因为 CompositeByteBuf 并没有真正将多个 Buffer 组合起来，而是保存了它们的引用，从而避免了数据的拷贝，实现了零拷贝。
+(3)、对于 FileChannel.transferTo 的使用：Netty 中使用了 FileChannel 的 transferTo 方法，该方法依赖于操作系统实现零拷贝。
+
+
+
+Composite Buffer 是如何实现零拷贝的？
+========================================================================================================================
+假设我们有一份协议数据，它由头部和消息体组成，而头部和消息体是分别存放在两个ByteBuf中的，即：
+ByteBuf header = ...
+ByteBuf body = ...
+
+我们在代码处理中，通常希望将 header 和 body 合并为一个 ByteBuf，方便处理，那么通常的做法是：
+
+ByteBuf allBuf = Unpooled.buffer(header.readableBytes() + body.readableBytes());
+allBuf.writeBytes(header);
+allBuf.writeBytes(body);
+
+可以看到，我们将 header 和 body 都拷贝到了新的 allBuf 中，这无形中增加了两次额外的数据拷贝操作了。
+那么有没有更加高效优雅的方式实现相同的目的呢？我们来看下 CompositeByteBuf 是如何实现这样的需求的？
+
+ByteBuf header = ...
+ByteBuf body = ...
+CompositeByteBuf compositeByteBuf = Unpooled.compositeBuffer();
+compositeByteBuf.addComponents(true, header, body);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

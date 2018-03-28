@@ -1,0 +1,224 @@
+参考文章（推荐）
+https://segmentfault.com/a/1190000010093082
+
+
+SwappedByteBuf
+==========================================================================================
+netty 中的 ByteBuf 默认是使用的 big-endian 的，如果需要修改字节序，意味着读写数据的时候要进
+行顺序的转换，一般情况下我们会直接在 ByteBuf 的读写方法里去修改，但这样一位这要修改很多方法，
+netty 的做法是为每个 ByteBuf 继承一个 SwappedByteBuf，作为自身的字节序包装器。我们可以看下
+AbstractByteBuf 的 order 方法：
+
+@Override
+public ByteBuf order(ByteOrder endianness) {
+    if (endianness == null) {
+        throw new NullPointerException("endianness");
+    }
+    if (endianness == order()) {
+        return this;
+    }
+
+    SwappedByteBuf swappedBuf = this.swappedBuf;
+    if (swappedBuf == null) {
+        this.swappedBuf = swappedBuf = new SwappedByteBuf(this);
+    }
+    return swappedBuf;
+}
+
+在 AbstractByteBuf 中组合了一个 SwappedByteBuf 实例，当它的 order 方法被调用来设置字节序时，
+如果设置的字节序与自身的字节序不同，那么就将自己披上 SwappedByteBuf 的外套，返回自身。接下
+来看 SwappedByteBuf 的具体实现。
+
+public final class SwappedByteBuf extends ByteBuf {
+
+    private final ByteBuf buf;
+    private final ByteOrder order;
+
+    public SwappedByteBuf(ByteBuf buf) {
+        if (buf == null) {
+            throw new NullPointerException("buf");
+        }
+        this.buf = buf;
+        if (buf.order() == ByteOrder.BIG_ENDIAN) {
+            order = ByteOrder.LITTLE_ENDIAN;
+        } else {
+            order = ByteOrder.BIG_ENDIAN;
+        }
+    }
+
+    ......
+}
+
+SwappedByteBuf 中维护了一个被 SwappedByteBuf 的 ByteBuf，以及新的 ByteOrder，与字节序无关
+的操作，都 delegate 给原来的 buf，例如：
+
+@Override
+public int capacity() {
+    return buf.capacity();
+}
+
+而与字节序有关的操作，则根据当前的字节序，对数据进行反排序处理，例如 writeInt 方法：
+ @Override
+public ByteBuf writeInt(int value) {
+    buf.writeInt(ByteBufUtil.swapInt(value));
+    return this;
+}
+/**
+ * Toggles the endianness of the specified 32-bit integer.
+ */
+public static int swapInt(int value) {
+    return Integer.reverseBytes(value);
+}
+
+同样，除了写数据相关的方法，读数据相关的方法也是这么处理的。
+
+引用计数
+==========================================================================================
+netty 中 ByteBuf 用来作为数据的容器，是一种频繁被创建和销毁的对象，ByteBuf 需要的内存空间，
+可以在 JVM Heap 中申请分配，也可以在 Direct Memory 中申请，其中在 Direct Memory 中分配的
+ByteBuf，其创建和销毁的代价比 JVM Heap 中的更高，但抛开哪个代价高、哪个代价低不说，光是频
+繁创建和销毁这一点，就已经奠定了效率不高的基调。于是，netty 中支持 ByteBuf 的池化，而引用
+计数就是实现池化的关键计数点，不过并非只有池化的 ByteBuf 才有引用计数，非池化的也会有。
+
+ByteBuf 类实现了 ReferenceCounted 接口，该接口标记一个类是一个引用计数管理对象，我们看下
+ReferenceCounted 接口：
+
+public interface ReferenceCounted {
+    int refCnt();
+
+    ReferenceCounted retain();
+
+    ReferenceCounted retain(int increment);
+
+    boolean release();
+
+    boolean release(int decrement);
+}
+
+每一个引用计数对象，都维护了自身的引用计数，当第一次被创建时，引用计数是 1，通过 refCnt()
+方法可以得到当前的引用计数，retain() retain(int increment) 增加自身的引用计数，而release()
+release(int increment) 则减少当前的引用计数，如果引用计数达到 0，并且当前的 ByteBuf 被释放
+成功，那这两个方法的返回值为 true。需要注意的是，各种不同类型的 ByteBuf 自己决定自己的释放
+方式，如果是“池化”的 ByteBuf，那么就会进池子；如果不是池化的，则销毁底层的字节数组引用
+或者释放对应的堆外内存。通过 AbstractReferenceCountedByteBuf 这个类的 release 方法实现，可以
+看出大概的执行逻辑：
+
+@Override
+public final boolean release() {
+    for (;;) {
+        int refCnt = this.refCnt;
+        if (refCnt == 0) {
+            throw new IllegalReferenceCountException(0, -1);
+        }
+
+        if (refCntUpdater.compareAndSet(this, refCnt, refCnt - 1)) {
+            if (refCnt == 1) {
+                deallocate();
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
+释放对象的方法定义在 deallocate() 方法里，而它是一个抽象的方法。
+1. 对于非池化的 heap ByteBuf 来说，释放对象实际上就是释放底层字节数组的引用：
+
+@Override
+protected void deallocate() {
+    array = null;
+}
+
+2. 对于非池化的 direct ByteBuf 来说，释放对象实际上就是释放堆外内存：
+@Override
+protected void deallocate() {
+    ByteBuffer buffer = this.buffer;
+    if (buffer == null) {
+        return;
+    }
+
+    this.buffer = null;
+
+    if (!doNotFree) {
+        PlatformDependent.freeDirectBuffer(buffer);
+    }
+
+    if (leak != null) {
+        leak.close();
+    }
+}
+
+3. 对于池化的 ByteBuf 来说，就是把自己归还到对象池里
+@Override
+protected final void deallocate() {
+    if (handle >= 0) {
+        final long handle = this.handle;
+        this.handle = -1;
+        memory = null;
+        chunk.arena.free(chunk, handle);
+        if (leak != null) {
+            leak.close();
+        } else {
+            recycle();
+        }
+    }
+}
+
+
+UnreleasableByteBuf 与引用计数
+==========================================================================================
+这个类是不可释放的 ByteBuf，它也是一个包装器模式的引用，被它包装的 ByteBuf 不会受引用计数的
+影响，不会被释放，它对 ReferenceCounted 接口的实现如下：
+
+@Override
+public ByteBuf retain(int increment) {
+    return this;
+}
+
+@Override
+public ByteBuf retain() {
+    return this;
+}
+
+@Override
+public boolean isReadable(int size) {
+    return buf.isReadable(size);
+}
+
+@Override
+public boolean isWritable(int size) {
+    return buf.isWritable(size);
+}
+
+@Override
+public int refCnt() {
+    return buf.refCnt();
+}
+
+这种 “不可释放的 ByteBuf”在什么情况下会用到呢？在一些静态的具有固定内容并且内容
+不变的 ByteBuf 时候会用到，因为非常常用，所以不需要释放，会更有效率。例如在处理HTTP
+协议的时候，经常需要返回带有回车换行的数据，这里回车换行就可以定义为一个静态的ByteBuf，
+并且不允许释放。
+
+
+EmptyByteBuf
+==========================================================================================
+EmptyByteBuf 是一个没有任何内容，也不允许读或者写的 ByteBuf，它存在的目的是为了在调用ByteBufAllocator
+创建新的 ByteBuf 的时候，如果指定容量大小为 0，则返回一个 EmptyByteBuf，这里仅仅是单例模式的
+一个运用。
+
+ReplayingDecoderBuffer
+==========================================================================================
+这个 ByteBuf 专用于 ReplayingDecoder，这个 decoder 主要是为了完成对一段已知长度报文进行全包
+获取，因为这个场景在网络编程中太常用了，因此 netty 单独实现了一个 ReplayingDecoder 来应对这种场景。
+
+
+ByteBuf 骨架实现
+==========================================================================================
+AbstractByteBuf 是 ByteBuf 的骨架实现，它实现了大部分与 ByteBuf 有关的功能方法，把不确定的
+行为留给抽象方法，交给它的实现者去实现。
+
+
+
+
+
